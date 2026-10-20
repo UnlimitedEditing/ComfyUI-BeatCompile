@@ -59,42 +59,49 @@ def tag_prompt(prompt):
 
 # ── manifest ─────────────────────────────────────────────────────────────────
 def parse_manifest(text):
-    """-> (by_slot {1..8: prompt}, extras [(url, prompt)]).
+    """-> (by_id {"video1": prompt, "image2": prompt, ...}, extras [(url, prompt)]).
 
-    Accepts JSON ({"1": "...", "https://..": "..."} or a list) or lines:
-        2: slow dolly in on a lighthouse
-        https://host/clip.mp4 | whip pan across a street      (extra clip, no slot)
-        a line with no prefix                                  (next free slot)
+    Accepts JSON ({"1": "...", "image2": "...", "https://..": "..."}) or lines:
+        2: slow dolly in on a lighthouse          (video slot 2; "v2:" also works)
+        i3: portrait of a knight                  (image slot 3)
+        https://host/clip.mp4 | whip pan          (extra clip or still, type by extension)
+        a line with no prefix                     (next free video slot)
     Chat frontends escape < and > with a backslash; strip those.
     """
     text = (text or "").replace("\\<", "<").replace("\\>", ">").strip()
-    by_slot, extras = {}, []
+    by_id, extras = {}, []
     if not text:
-        return by_slot, extras
+        return by_id, extras
+
+    def key(prefix, n):
+        return f"{'image' if prefix == 'i' else 'video'}{int(n)}"
+
     try:
         data = json.loads(text)
         if isinstance(data, dict):
             for k, v in data.items():
-                if str(k).startswith("http"):
-                    extras.append((str(k), str(v)))
-                elif str(k).isdigit():
-                    by_slot[int(k)] = str(v)
-            return by_slot, extras
+                k = str(k)
+                if k.startswith("http"):
+                    extras.append((k, str(v)))
+                elif re.fullmatch(r"(?:video|image|v|i)?\d{1,2}", k):
+                    pre = "i" if k.startswith("i") else "v"
+                    by_id[key(pre, re.sub(r"\D", "", k))] = str(v)
+            return by_id, extras
         if isinstance(data, list):
-            for i, v in enumerate(data, 1):
-                by_slot[i] = str(v)
-            return by_slot, extras
+            for n, v in enumerate(data, 1):
+                by_id[key("v", n)] = str(v)
+            return by_id, extras
     except ValueError:
         pass
     # The Graydient API collapses newlines to spaces, so a manifest usually arrives as ONE line.
-    # Re-split before each "N:" marker (N must run 1,2,3.. in order, so "at 5: 30" inside a prompt
-    # does not split; to skip a slot write "3: -") and before bare URLs.
-    marks, last = [], 0
-    for m in re.finditer(r"(?:(?<=\s)|^)(\d{1,2})\s*:\s", text):
-        n = int(m.group(1))
-        if (last == 0 and n <= 8) or n == last + 1:      # numbers must run consecutively
+    # Re-split before each "N:" / "iN:" marker (per kind, N must run 1,2,3.. in order, so "at 5: 30"
+    # inside a prompt does not split; to skip a slot write "3: -") and before bare URLs.
+    marks, last = [], {"v": 0, "i": 0}
+    for m in re.finditer(r"(?:(?<=\s)|^)([vi]?)(\d{1,2})\s*:\s", text):
+        kind, n = ("i" if m.group(1) == "i" else "v"), int(m.group(2))
+        if (last[kind] == 0 and n <= 8) or n == last[kind] + 1:
             marks.append(m.start())
-            last = n
+            last[kind] = n
     for m in re.finditer(r"(?:(?<=\s)|^)https?://\S+\s*\|", text):
         marks.append(m.start())
     if marks:
@@ -106,19 +113,21 @@ def parse_manifest(text):
     for line in (l.strip() for l in text.splitlines()):
         if not line:
             continue
-        m = re.match(r"^(\d{1,2})\s*[:|)\-]\s*(.*)$", line)
+        m = re.match(r"^([vi]?)(\d{1,2})\s*[:|)\-]\s*(.*)$", line)
         if m:
-            by_slot[int(m.group(1))] = m.group(2).strip()
-            nxt = int(m.group(1)) + 1
+            pre = "i" if m.group(1) == "i" else "v"
+            by_id[key(pre, m.group(2))] = m.group(3).strip()
+            if pre == "v":
+                nxt = int(m.group(2)) + 1
         elif line.startswith("http"):
             url, _, pr = line.partition("|")
             extras.append((url.strip(), pr.strip()))
         else:
-            while nxt in by_slot:
+            while key("v", nxt) in by_id:
                 nxt += 1
-            by_slot[nxt] = line
+            by_id[key("v", nxt)] = line
             nxt += 1
-    return by_slot, extras
+    return by_id, extras
 
 
 # ── media helpers ────────────────────────────────────────────────────────────
@@ -355,12 +364,33 @@ def assign_clips(segs, clips, seed, use_all=False):
         c = best
         if cursor[c["id"]] + d > c["duration"] - 0.05:
             cursor[c["id"]] = 0.0
-        s["clip"], s["src_start"] = c["id"], round(cursor[c["id"]], 3)
+        s["clip"], s["src_start"], s["use_n"] = c["id"], round(cursor[c["id"]], 3), uses[c["id"]]
         cursor[c["id"]] += d
         uses[c["id"]] += 1
         prev_id, prev_motion = c["id"], c["motion"]
     return segs
 
+
+
+# ── still images: Ken Burns move picked from the prompt's camera words ───────
+def still_filter(c, use_n, nf, w, h, fps):
+    """zoompan chain for one still. Direction flips on every reuse so repeats do not look identical."""
+    a = round(0.10 + 0.25 * c["intensity"], 3)          # move amount grows with clip intensity
+    p = use_n % 2
+    base = (f"scale={2 * w}:{2 * h}:force_original_aspect_ratio=increase,"
+            f"crop={2 * w}:{2 * h},setsar=1")
+    center = "x='(iw-iw/zoom)/2':y='(ih-ih/zoom)/2'"
+    m = c["motion"]
+    if m in ("zoom", "fly", "whip"):
+        a = a * (1.6 if m == "whip" else 1.0)
+        z = f"z='1+{a}*on/{nf}'" if p == 0 else f"z='{1 + a}-{a}*on/{nf}'"
+        zp = f"{z}:{center}"
+    elif m in ("pan", "handheld", "orbit"):
+        direction = "on" if p == 0 else f"({nf}-on)"
+        zp = f"z='1.18':x='{direction}/{nf}*(iw-iw/zoom)':y='(ih-ih/zoom)/2'"
+    else:                                               # static / unknown: slow drift
+        zp = f"z='1+0.05*on/{nf}':{center}" if p == 0 else f"z='1.05-0.05*on/{nf}':{center}"
+    return f"{base},zoompan={zp}:d={nf}:s={w}x{h}:fps={fps}"
 
 # ── render ───────────────────────────────────────────────────────────────────
 def render(segs, clips_by_id, audio_path, out_path, width, height, fps, tmp_dir, total_dur):
@@ -374,6 +404,13 @@ def render(segs, clips_by_id, audio_path, out_path, width, height, fps, tmp_dir,
         c = clips_by_id[s["clip"]]
         seg_path = os.path.join(tmp_dir, f"seg_{k:04d}.mp4")
         need = nf / fps
+        if c.get("kind") == "image":
+            vf = still_filter(c, s.get("use_n", 0), nf, width, height, fps)
+            cmd = ["ffmpeg", "-y", "-v", "error", "-i", c["path"], "-an", "-vf", vf,
+                   "-frames:v", str(nf), "-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
+                   "-pix_fmt", "yuv420p", "-r", str(fps), seg_path]
+            jobs.append((k, cmd, seg_path))
+            continue
         vf = (f"scale={width}:{height}:force_original_aspect_ratio=increase,"
               f"crop={width}:{height},fps={fps},setsar=1,"
               f"tpad=stop_mode=clone:stop_duration={need:.3f}")
@@ -409,25 +446,37 @@ def render(segs, clips_by_id, audio_path, out_path, width, height, fps, tmp_dir,
 
 
 # ── top level ────────────────────────────────────────────────────────────────
+IMAGE_EXT = (".png", ".jpg", ".jpeg", ".webp", ".bmp")
+
+
 def compile_montage(audio_file, manifest, video_files, input_dir, out_path, *, height=720, aspect=0,
                     fps=24, max_frames=2880, cut_density=1.0, seed=0, overedit=0.0, use_all=False,
-                    log=print):
+                    image_files=(), log=print):
     tmp = tempfile.mkdtemp(prefix="beatcompile_")
-    by_slot, extras = parse_manifest(manifest)
+    by_id, extras = parse_manifest(manifest)
     clips = []
     for slot, name in enumerate(video_files, 1):
         p = resolve_file(name, input_dir, tmp)
         if p:
-            clips.append({"id": f"video{slot}", "path": p, "prompt": by_slot.get(slot, "")})
+            clips.append({"id": f"video{slot}", "path": p, "kind": "video",
+                          "prompt": by_id.get(f"video{slot}", "")})
+    for slot, name in enumerate(image_files, 1):
+        p = resolve_file(name, input_dir, tmp)
+        if p:
+            clips.append({"id": f"image{slot}", "path": p, "kind": "image",
+                          "prompt": by_id.get(f"image{slot}", "")})
     for n, (url, pr) in enumerate(extras[:24], 1):
         try:
-            clips.append({"id": f"extra{n}", "path": download(url, tmp), "prompt": pr})
+            path = download(url, tmp)
+            ext = os.path.splitext(url.split("?")[0])[-1].lower()
+            clips.append({"id": f"extra{n}", "path": path,
+                          "kind": "image" if ext in IMAGE_EXT else "video", "prompt": pr})
         except Exception as e:                                  # one bad URL should not kill the job
             log(f"[BeatCompile] extra clip {url} skipped: {e}")
     if not clips:
-        raise RuntimeError("no input clips resolved (video1..video8 empty and no URLs in the manifest)")
+        raise RuntimeError("no input clips resolved (video1-8 / image1-8 empty and no URLs in the manifest)")
     for c in clips:
-        c["duration"] = probe_duration(c["path"])
+        c["duration"] = 1e6 if c["kind"] == "image" else probe_duration(c["path"])   # stills never run out
         c["motion"], c["intensity"] = tag_prompt(c["prompt"])
     clips = [c for c in clips if c["duration"] > 0.2]
     audio = resolve_file(audio_file, input_dir, tmp)
@@ -447,7 +496,7 @@ def compile_montage(audio_file, manifest, video_files, input_dir, out_path, *, h
     render(segs, {c["id"]: c for c in clips}, audio, out_path, w, h, int(fps), tmp, an["duration"])
     report = {"overedit_used": round(over_used, 2), "clips_used": len(used),
               "bpm": round(an["bpm"], 2), "duration": round(an["duration"], 2), "size": f"{w}x{h}",
-              "clips": [{k: c[k] for k in ("id", "prompt", "motion", "intensity", "duration")} for c in clips],
+              "clips": [{k: c[k] for k in ("id", "kind", "prompt", "motion", "intensity")} for c in clips],
               "segments": [{"t0": round(s["t0"], 2), "t1": round(s["t1"], 2), "energy": round(s["energy"], 2),
                             "drop": s["drop"], "clip": s["clip"], "src_start": s["src_start"]} for s in segs]}
     return out_path, report

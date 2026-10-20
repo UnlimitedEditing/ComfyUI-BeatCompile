@@ -45,6 +45,8 @@ class BeatCompile:
         }
         for i in range(1, 9):
             req[f"video{i}"] = ("STRING", {"default": ""})
+        for i in range(1, 9):
+            req[f"image{i}"] = ("STRING", {"default": ""})
         return {"required": req}
 
     RETURN_TYPES = ("VIDEO", "STRING", "IMAGE")
@@ -53,15 +55,17 @@ class BeatCompile:
     CATEGORY = "BeatCompile"
 
     async def run(self, audio_file, manifest, height, aspect, fps, max_frames, cut_density,
-                  shuffle_seed, overedit, use_all, video1, video2, video3, video4, video5, video6, video7, video8):
+                  shuffle_seed, overedit, use_all, video1, video2, video3, video4, video5, video6, video7, video8,
+                  image1, image2, image3, image4, image5, image6, image7, image8):
         # ffmpeg + librosa are blocking; keep the event loop alive (a blocked loop can make a
         # finished Graydient job report timed_out).
         return await asyncio.to_thread(
             self._run_sync, audio_file, manifest, height, aspect, fps, max_frames, cut_density,
-            shuffle_seed, overedit, use_all, [video1, video2, video3, video4, video5, video6, video7, video8])
+            shuffle_seed, overedit, use_all, [video1, video2, video3, video4, video5, video6, video7, video8],
+            [image1, image2, image3, image4, image5, image6, image7, image8])
 
     def _run_sync(self, audio_file, manifest, height, aspect, fps, max_frames, cut_density, seed,
-                  overedit, use_all, vids):
+                  overedit, use_all, vids, imgs):
         from comfy_api.latest import InputImpl
         try:
             import folder_paths
@@ -72,7 +76,7 @@ class BeatCompile:
         path, report = core.compile_montage(
             audio_file, manifest, vids, input_dir, out, height=height, aspect=aspect, fps=fps,
             max_frames=max_frames, cut_density=cut_density, seed=seed, overedit=overedit,
-            use_all=bool(use_all))
+            use_all=bool(use_all), image_files=imgs)
         text = json.dumps(report, indent=1)
         return (InputImpl.VideoFromFile(path), text, _encode_string_as_image(text))
 
