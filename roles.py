@@ -188,6 +188,30 @@ def label_beats(energy, duration, beats):
     for i in range(n):
         if drop[i]:
             lab[i] = "drop"
+    return _smooth(lab)
+
+
+def _smooth(lab):
+    """Absorb short label runs (flicker) into the previous run; drops are never absorbed."""
+    min_run = {"build": 4, "break": 4, "intro": 4, "outro": 4, "release": 2}
+    for _ in range(len(lab) + 1):
+        runs, i = [], 0
+        while i < len(lab):
+            j = i
+            while j < len(lab) and lab[j] == lab[i]:
+                j += 1
+            runs.append((i, j, lab[i]))
+            i = j
+        changed = False
+        for k, (a, b, l) in enumerate(runs):
+            if l != "drop" and b - a < min_run.get(l, 4) and len(runs) > 1:
+                tgt = runs[k - 1][2] if k > 0 else runs[k + 1][2]
+                for x in range(a, b):
+                    lab[x] = tgt
+                changed = True
+                break
+        if not changed:
+            break
     return lab
 
 
@@ -325,7 +349,10 @@ def assign_clips(segs, clips, seed, use_all=False):
         d = s["t1"] - s["t0"]
         if idx in reserved:
             chosen = by_id[reserved[idx]]
-        elif forced_next and forced_next in by_id and forced_next != prev:
+        elif (forced_next and forced_next in by_id and forced_next != prev and
+              not ((("once" in by_id[forced_next]["flags"]) or by_id[forced_next]["role"] == "hero")
+                   and uses[forced_next] >= 1) and
+              not (by_id[forced_next]["role"] == "hero" and idx != hero_idx)):
             chosen = by_id[forced_next]
         elif idx in forced_cov:
             chosen = by_id[forced_cov[idx]]
@@ -356,7 +383,7 @@ def _split(seg, t_cut, head_clip, head_cursor):
 
 
 def apply_inserts(segs, clips, fps):
-    """flash clips cut in over drop segments (every 3rd); accent clips punctuate the head of each drop
+    """flash clips cut in over drop segments (every 4th); accent clips punctuate the head of each drop
     and every 8th drop segment. Long segments are split (head/tail piece of ~3-5 frames); short ones
     (frenetic sections) are swapped whole."""
     flashers = [c for c in clips if "flash" in c["flags"] and c["role"] != "accent"]
@@ -378,9 +405,9 @@ def apply_inserts(segs, clips, fps):
             elif d <= 0.40:
                 pieces = [{**s, "clip": c["id"], "src_start": round(offs[c["id"]], 3), "insert": True}]
             offs[c["id"]] = (offs[c["id"]] + ac) % max(0.1, c["duration"] - ac)
-        if in_drop and flashers and drop_n % 3 == 2 and pieces[-1]["clip"] not in flash_ids \
+        if in_drop and flashers and drop_n % 4 == 3 and pieces[-1]["clip"] not in flash_ids \
                 and not pieces[-1].get("insert"):
-            c = flashers[(drop_n // 3) % len(flashers)]
+            c = flashers[(drop_n // 4) % len(flashers)]
             main = pieces[-1]
             md = main["t1"] - main["t0"]
             if md >= fl + 0.35:
