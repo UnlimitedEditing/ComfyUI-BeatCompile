@@ -37,7 +37,7 @@ class BeatCompile:
             "height": ("INT", {"default": 720, "min": 240, "max": 1080, "step": 2}),
             "aspect": ("INT", {"default": 0, "min": 0, "max": 3}),   # 0 16:9, 1 9:16, 2 1:1, 3 4:3
             "fps": ("INT", {"default": 24, "min": 12, "max": 60}),
-            "max_frames": ("INT", {"default": 2880, "min": 48, "max": 7200}),
+            "max_frames": ("INT", {"default": 7200, "min": 48, "max": 14400}),
             "cut_density": ("FLOAT", {"default": 1.0, "min": 0.25, "max": 4.0, "step": 0.05}),
             "shuffle_seed": ("INT", {"default": 0, "min": 0, "max": 2**31 - 1}),
             "overedit": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 1.0, "step": 0.05}),

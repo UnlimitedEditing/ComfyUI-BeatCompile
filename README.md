@@ -257,7 +257,7 @@ Options go in the command **before** the media fields (`/video1...`). A `/slotN:
 | `/slot7:` | Over-edit. Splits cuts into rhythms. `0` off, `1` frenetic | `0` | 0 to 1 |
 | `/slot8:` | `1` = make sure **every clip appears** | `0` | 0 or 1 |
 | `/fps:` | Output frame rate | `24` | 12 to 60 |
-| `/length:` | Maximum frames. The song is trimmed to this | `2880` (2 min at 24 fps) | 48 to 7200 |
+| `/length:` | Maximum frames. The song is trimmed to this | `7200` (5 min at 24 fps) | 48 to 14400 |
 | `/seed:` | Shuffle seed. Change it for a different arrangement | `0` | any |
 
 **Over-edit** adds a measurable rhythm to the cuts: eighth notes, a 3+3+2 tresillo, sixteenth-note stutter, and
