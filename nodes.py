@@ -47,6 +47,9 @@ class BeatCompile:
             req[f"video{i}"] = ("STRING", {"default": ""})
         for i in range(1, 9):
             req[f"image{i}"] = ("STRING", {"default": ""})
+        # Telegram "reply to an audio file" arrives as init_audio_* (not audio1): fallbacks, first non-empty wins
+        req["audio_init_filename"] = ("STRING", {"default": ""})
+        req["audio_init_url"] = ("STRING", {"default": ""})
         return {"required": req}
 
     RETURN_TYPES = ("VIDEO", "STRING", "IMAGE")
@@ -56,16 +59,18 @@ class BeatCompile:
 
     async def run(self, audio_file, manifest, height, aspect, fps, max_frames, cut_density,
                   shuffle_seed, overedit, use_all, video1, video2, video3, video4, video5, video6, video7, video8,
-                  image1, image2, image3, image4, image5, image6, image7, image8):
+                  image1, image2, image3, image4, image5, image6, image7, image8,
+                  audio_init_filename, audio_init_url):
         # ffmpeg + librosa are blocking; keep the event loop alive (a blocked loop can make a
         # finished Graydient job report timed_out).
         return await asyncio.to_thread(
             self._run_sync, audio_file, manifest, height, aspect, fps, max_frames, cut_density,
             shuffle_seed, overedit, use_all, [video1, video2, video3, video4, video5, video6, video7, video8],
-            [image1, image2, image3, image4, image5, image6, image7, image8])
+            [image1, image2, image3, image4, image5, image6, image7, image8],
+            audio_file or audio_init_filename or audio_init_url)
 
     def _run_sync(self, audio_file, manifest, height, aspect, fps, max_frames, cut_density, seed,
-                  overedit, use_all, vids, imgs):
+                  overedit, use_all, vids, imgs, audio_src):
         from comfy_api.latest import InputImpl
         try:
             import folder_paths
@@ -74,7 +79,7 @@ class BeatCompile:
             input_dir = ""
         out = os.path.join(tempfile.mkdtemp(prefix="beatcompile_out_"), "compilation.mp4")
         path, report = core.compile_montage(
-            audio_file, manifest, vids, input_dir, out, height=height, aspect=aspect, fps=fps,
+            audio_src, manifest, vids, input_dir, out, height=height, aspect=aspect, fps=fps,
             max_frames=max_frames, cut_density=cut_density, seed=seed, overedit=overedit,
             use_all=bool(use_all), image_files=imgs)
         text = json.dumps(report, indent=1)
