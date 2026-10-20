@@ -16,6 +16,13 @@ import tempfile
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 
+try:
+    from .roles import (parse_manifest, classify_role, label_beats, section_list, assign_clips,
+                        apply_inserts)
+except ImportError:                      # standalone use / tests
+    from roles import (parse_manifest, classify_role, label_beats, section_list, assign_clips,
+                       apply_inserts)
+
 UA = {"User-Agent": "Mozilla/5.0 (compatible; BeatCompile/1.0)"}
 
 # ── motion tagging ───────────────────────────────────────────────────────────
@@ -58,78 +65,6 @@ def tag_prompt(prompt):
 
 
 # ── manifest ─────────────────────────────────────────────────────────────────
-def parse_manifest(text):
-    """-> (by_id {"video1": prompt, "image2": prompt, ...}, extras [(url, prompt)]).
-
-    Accepts JSON ({"1": "...", "image2": "...", "https://..": "..."}) or lines:
-        2: slow dolly in on a lighthouse          (video slot 2; "v2:" also works)
-        i3: portrait of a knight                  (image slot 3)
-        https://host/clip.mp4 | whip pan          (extra clip or still, type by extension)
-        a line with no prefix                     (next free video slot)
-    Chat frontends escape < and > with a backslash; strip those.
-    """
-    text = (text or "").replace("\\<", "<").replace("\\>", ">").strip()
-    by_id, extras = {}, []
-    if not text:
-        return by_id, extras
-
-    def key(prefix, n):
-        return f"{'image' if prefix == 'i' else 'video'}{int(n)}"
-
-    try:
-        data = json.loads(text)
-        if isinstance(data, dict):
-            for k, v in data.items():
-                k = str(k)
-                if k.startswith("http"):
-                    extras.append((k, str(v)))
-                elif re.fullmatch(r"(?:video|image|v|i)?\d{1,2}", k):
-                    pre = "i" if k.startswith("i") else "v"
-                    by_id[key(pre, re.sub(r"\D", "", k))] = str(v)
-            return by_id, extras
-        if isinstance(data, list):
-            for n, v in enumerate(data, 1):
-                by_id[key("v", n)] = str(v)
-            return by_id, extras
-    except ValueError:
-        pass
-    # The Graydient API collapses newlines to spaces, so a manifest usually arrives as ONE line.
-    # Re-split before each "N:" / "iN:" marker (per kind, N must run 1,2,3.. in order, so "at 5: 30"
-    # inside a prompt does not split; to skip a slot write "3: -") and before bare URLs.
-    marks, last = [], {"v": 0, "i": 0}
-    for m in re.finditer(r"(?:(?<=\s)|^)([vi]?)(\d{1,2})\s*:\s", text):
-        kind, n = ("i" if m.group(1) == "i" else "v"), int(m.group(2))
-        if (last[kind] == 0 and n <= 8) or n == last[kind] + 1:
-            marks.append(m.start())
-            last[kind] = n
-    for m in re.finditer(r"(?:(?<=\s)|^)https?://\S+\s*\|", text):
-        marks.append(m.start())
-    if marks:
-        cuts = sorted(set(marks))
-        pieces = ([text[:cuts[0]]] if cuts[0] > 0 else []) + \
-                 [text[a:b] for a, b in zip(cuts, cuts[1:] + [len(text)])]
-        text = "\n".join(p.strip() for p in pieces if p.strip())
-    nxt = 1
-    for line in (l.strip() for l in text.splitlines()):
-        if not line:
-            continue
-        m = re.match(r"^([vi]?)(\d{1,2})\s*[:|)\-]\s*(.*)$", line)
-        if m:
-            pre = "i" if m.group(1) == "i" else "v"
-            by_id[key(pre, m.group(2))] = m.group(3).strip()
-            if pre == "v":
-                nxt = int(m.group(2)) + 1
-        elif line.startswith("http"):
-            url, _, pr = line.partition("|")
-            extras.append((url.strip(), pr.strip()))
-        else:
-            while key("v", nxt) in by_id:
-                nxt += 1
-            by_id[key("v", nxt)] = line
-            nxt += 1
-    return by_id, extras
-
-
 # ── media helpers ────────────────────────────────────────────────────────────
 def _run(cmd, **kw):
     return subprocess.run(cmd, capture_output=True, text=True, **kw)
@@ -219,7 +154,8 @@ def analyze_audio(audio_path, max_seconds, tmp_dir):
     for i in range(4, len(sm)):
         if sm[i] - sm[i - 4:i].mean() > 0.35 * (sm.max() - sm.min() + 1e-9) and rank[i] > 0.7:
             drop[i] = True
-    return {"duration": duration, "bpm": bpm, "beats": beats, "energy": rank.tolist(), "drop": drop}
+    return {"duration": duration, "bpm": bpm, "beats": beats, "energy": rank.tolist(), "drop": drop,
+            "labels": label_beats(rank.tolist(), duration, beats)}
 
 
 # ── planning ─────────────────────────────────────────────────────────────────
@@ -327,51 +263,6 @@ def plan_with_coverage(analysis, density, over, fps, n_clips, use_all):
     return segs, o
 
 
-def assign_clips(segs, clips, seed, use_all=False):
-    rng = random.Random(seed)
-    uses = {c["id"]: 0 for c in clips}
-    cursor = {c["id"]: 0.0 for c in clips}
-    prev_id = prev_motion = None
-    forced = {}
-    if use_all:   # every clip gets the segment whose energy best matches it (rarest fit first)
-        free = set(range(len(segs)))
-        order = sorted(clips, key=lambda c: -abs(c["intensity"] - 0.5))
-        for c in order:
-            if not free:
-                break
-            k = min(free, key=lambda i: abs(segs[i]["energy"] - c["intensity"]) +
-                    (0.5 if (i - 1 in forced and forced[i - 1] == c["id"]) or
-                     (i + 1 in forced and forced[i + 1] == c["id"]) else 0.0))
-            forced[k] = c["id"]
-            free.discard(k)
-    by_id = {c["id"]: c for c in clips}
-    for idx, s in enumerate(segs):
-        d = s["t1"] - s["t0"]
-        target = min(1.0, s["energy"] + (0.12 if s["drop"] else 0.0))
-        best, best_score = None, -1e9
-        for c in ([by_id[forced[idx]]] if idx in forced else clips):
-            sc = -abs(c["intensity"] - target)
-            if len(clips) > 1 and c["id"] == prev_id:
-                sc -= 1.0
-            if c["motion"] == prev_motion and c["motion"] != "unknown":
-                sc -= 0.12
-            sc -= 0.15 * uses[c["id"]]
-            if c["duration"] - cursor[c["id"]] < d:
-                sc -= 0.25
-            sc += rng.uniform(-0.05, 0.05)
-            if sc > best_score:
-                best, best_score = c, sc
-        c = best
-        if cursor[c["id"]] + d > c["duration"] - 0.05:
-            cursor[c["id"]] = 0.0
-        s["clip"], s["src_start"], s["use_n"] = c["id"], round(cursor[c["id"]], 3), uses[c["id"]]
-        cursor[c["id"]] += d
-        uses[c["id"]] += 1
-        prev_id, prev_motion = c["id"], c["motion"]
-    return segs
-
-
-
 # ── still images: Ken Burns move picked from the prompt's camera words ───────
 def still_filter(c, use_n, nf, w, h, fps):
     """zoompan chain for one still. Direction flips on every reuse so repeats do not look identical."""
@@ -392,6 +283,27 @@ def still_filter(c, use_n, nf, w, h, fps):
         zp = f"z='1+0.05*on/{nf}':{center}" if p == 0 else f"z='1.05-0.05*on/{nf}':{center}"
     return f"{base},zoompan={zp}:d={nf}:s={w}x{h}:fps={fps}"
 
+
+def seg_fx(c, s, nf, w, h, fps):
+    """Extra filters appended after the base scale/crop: punch-in pulse on the kick, white flash on drops."""
+    out = ""
+    if "punch" in c["flags"] and nf >= 3:
+        p = max(2, round(0.18 * fps))
+        z = f"(1+0.12*max(0\\,1-n/{p}))"
+        out += f",scale=w='trunc({w}*{z}/2)*2':h='trunc({h}*{z}/2)*2':eval=frame,crop={w}:{h}"
+    if s.get("wflash"):
+        out += f",fade=t=in:st=0:d={2.0 / fps:.4f}:color=white"
+    return out
+
+
+def make_pingpong(path, tmp, idx):
+    """forward + reversed copy so a short clip loops without a jump cut."""
+    out = os.path.join(tmp, f"pp_{idx}.mp4")
+    r = _run(["ffmpeg", "-y", "-v", "error", "-i", path, "-filter_complex",
+              "[0:v]split[a][b];[b]reverse[r];[a][r]concat=n=2:v=1:a=0[o]", "-map", "[o]", "-an",
+              "-c:v", "libx264", "-preset", "veryfast", "-crf", "18", "-pix_fmt", "yuv420p", out])
+    return out if r.returncode == 0 and os.path.isfile(out) else None
+
 # ── render ───────────────────────────────────────────────────────────────────
 def render(segs, clips_by_id, audio_path, out_path, width, height, fps, tmp_dir, total_dur):
     # frame-exact boundaries: round cumulative times, never per-segment lengths
@@ -405,7 +317,7 @@ def render(segs, clips_by_id, audio_path, out_path, width, height, fps, tmp_dir,
         seg_path = os.path.join(tmp_dir, f"seg_{k:04d}.mp4")
         need = nf / fps
         if c.get("kind") == "image":
-            vf = still_filter(c, s.get("use_n", 0), nf, width, height, fps)
+            vf = still_filter(c, s.get("use_n", 0), nf, width, height, fps) + seg_fx(c, s, nf, width, height, fps)
             cmd = ["ffmpeg", "-y", "-v", "error", "-i", c["path"], "-an", "-vf", vf,
                    "-frames:v", str(nf), "-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
                    "-pix_fmt", "yuv420p", "-r", str(fps), seg_path]
@@ -413,7 +325,7 @@ def render(segs, clips_by_id, audio_path, out_path, width, height, fps, tmp_dir,
             continue
         vf = (f"scale={width}:{height}:force_original_aspect_ratio=increase,"
               f"crop={width}:{height},fps={fps},setsar=1,"
-              f"tpad=stop_mode=clone:stop_duration={need:.3f}")
+              f"tpad=stop_mode=clone:stop_duration={need:.3f}" + seg_fx(c, s, nf, width, height, fps))
         cmd = ["ffmpeg", "-y", "-v", "error", "-ss", f"{s['src_start']:.3f}", "-i", c["path"],
                "-an", "-vf", vf, "-frames:v", str(nf), "-c:v", "libx264", "-preset", "veryfast",
                "-crf", "20", "-pix_fmt", "yuv420p", "-r", str(fps), seg_path]
@@ -453,40 +365,63 @@ def compile_montage(audio_file, manifest, video_files, input_dir, out_path, *, h
                     fps=24, max_frames=2880, cut_density=1.0, seed=0, overedit=0.0, use_all=False,
                     image_files=(), log=print):
     tmp = tempfile.mkdtemp(prefix="beatcompile_")
-    by_id, extras = parse_manifest(manifest)
+    entries, extras, all_flags = parse_manifest(manifest)
+    blank = {"role": None, "flags": set(), "with": [], "then": [], "not": [],
+             "after": [], "before": [], "in": [], "prompt": ""}
     clips = []
+
+    def add(cid, path, kind, e):
+        clips.append({"id": cid, "path": path, "kind": kind, "entry": e, "prompt": e.get("prompt", "")})
+
     for slot, name in enumerate(video_files, 1):
         p = resolve_file(name, input_dir, tmp)
         if p:
-            clips.append({"id": f"video{slot}", "path": p, "kind": "video",
-                          "prompt": by_id.get(f"video{slot}", "")})
+            add(f"video{slot}", p, "video", entries.get(f"video{slot}", blank))
     for slot, name in enumerate(image_files, 1):
         p = resolve_file(name, input_dir, tmp)
         if p:
-            clips.append({"id": f"image{slot}", "path": p, "kind": "image",
-                          "prompt": by_id.get(f"image{slot}", "")})
-    for n, (url, pr) in enumerate(extras[:24], 1):
+            add(f"image{slot}", p, "image", entries.get(f"image{slot}", blank))
+    for n, e in enumerate(extras[:24], 1):
         try:
-            path = download(url, tmp)
-            ext = os.path.splitext(url.split("?")[0])[-1].lower()
-            clips.append({"id": f"extra{n}", "path": path,
-                          "kind": "image" if ext in IMAGE_EXT else "video", "prompt": pr})
-        except Exception as e:                                  # one bad URL should not kill the job
-            log(f"[BeatCompile] extra clip {url} skipped: {e}")
+            path = download(e["url"], tmp)
+            ext = os.path.splitext(e["url"].split("?")[0])[-1].lower()
+            add(f"extra{n}", path, "image" if ext in IMAGE_EXT else "video", e)
+        except Exception as ex:                                 # one bad URL should not kill the job
+            log(f"[BeatCompile] extra clip {e['url']} skipped: {ex}")
     if not clips:
         raise RuntimeError("no input clips resolved (video1-8 / image1-8 empty and no URLs in the manifest)")
     for c in clips:
         c["duration"] = 1e6 if c["kind"] == "image" else probe_duration(c["path"])   # stills never run out
         c["motion"], c["intensity"] = tag_prompt(c["prompt"])
+        e = c["entry"]
+        c["role"] = e.get("role") or classify_role(c["prompt"], c["motion"], c["intensity"])
+        c["flags"] = set(e.get("flags", ())) | set(all_flags)
+        c["rel"] = {k: list(e.get(k, [])) for k in ("with", "then", "not", "after", "before", "in")}
     clips = [c for c in clips if c["duration"] > 0.2]
+    for k, c in enumerate(clips):               # short clips loop forward+back instead of jump-cutting
+        if c["kind"] == "video" and ("pingpong" in c["flags"] or
+                                     (c["duration"] < 3.0 and "jump" not in c["flags"])):
+            pp = make_pingpong(c["path"], tmp, k)
+            if pp:
+                c["path"], c["duration"], c["pingpong"] = pp, c["duration"] * 2, True
     audio = resolve_file(audio_file, input_dir, tmp)
     if not audio:
         raise RuntimeError(f"audio file not found: {audio_file!r}")
     max_seconds = max(5.0, max_frames / float(fps))
     an = analyze_audio(audio, max_seconds, tmp)
     segs, over_used = plan_with_coverage(an, cut_density, float(overedit), int(fps), len(clips), bool(use_all))
+    labels = an["labels"]
+    for s in segs:
+        s["sec"] = labels[min(s["i"], len(labels) - 1)]
+    if "dropflash" in all_flags or any("dropflash" in c["flags"] for c in clips):
+        prev = None
+        for s in segs:
+            if s["sec"] == "drop" and prev != "drop":
+                s["wflash"] = True
+            prev = s["sec"]
     segs = assign_clips(segs, clips, seed, bool(use_all))
-    used = {s['clip'] for s in segs}
+    segs = apply_inserts(segs, clips, int(fps))
+    used = {s["clip"] for s in segs}
     if len(used) < len(clips):
         log(f"[BeatCompile] only {len(used)}/{len(clips)} clips fit this song's length")
     ar = {0: 16 / 9, 1: 9 / 16, 2: 1.0, 3: 4 / 3}.get(int(aspect), 16 / 9)
@@ -496,7 +431,12 @@ def compile_montage(audio_file, manifest, video_files, input_dir, out_path, *, h
     render(segs, {c["id"]: c for c in clips}, audio, out_path, w, h, int(fps), tmp, an["duration"])
     report = {"overedit_used": round(over_used, 2), "clips_used": len(used),
               "bpm": round(an["bpm"], 2), "duration": round(an["duration"], 2), "size": f"{w}x{h}",
-              "clips": [{k: c[k] for k in ("id", "kind", "prompt", "motion", "intensity")} for c in clips],
-              "segments": [{"t0": round(s["t0"], 2), "t1": round(s["t1"], 2), "energy": round(s["energy"], 2),
-                            "drop": s["drop"], "clip": s["clip"], "src_start": s["src_start"]} for s in segs]}
+              "sections": section_list(segs),
+              "clips": [{"id": c["id"], "kind": c["kind"], "role": c["role"], "flags": sorted(c["flags"]),
+                         "motion": c["motion"], "intensity": c["intensity"], "prompt": c["prompt"],
+                         "pingpong": bool(c.get("pingpong"))} for c in clips],
+              "segments": [{"t0": round(s["t0"], 2), "t1": round(s["t1"], 2), "sec": s["sec"],
+                            "energy": round(s["energy"], 2), "drop": s["drop"], "clip": s["clip"],
+                            "src_start": s["src_start"], "insert": bool(s.get("insert")),
+                            "wflash": bool(s.get("wflash"))} for s in segs]}
     return out_path, report
