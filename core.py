@@ -50,7 +50,7 @@ def tag_prompt(prompt):
             motion, base = name, inten
             break
     else:
-        if p.strip():
+        if re.search(r"[a-z]", p):
             motion, base = "static", 0.30      # a described scene with no camera words
     base += 0.12 * min(2, len(re.findall(HIGH_WORDS, p)))
     base -= 0.10 * min(2, len(re.findall(LOW_WORDS, p)))
@@ -86,6 +86,22 @@ def parse_manifest(text):
             return by_slot, extras
     except ValueError:
         pass
+    # The Graydient API collapses newlines to spaces, so a manifest usually arrives as ONE line.
+    # Re-split before each "N:" marker (N must run 1,2,3.. in order, so "at 5: 30" inside a prompt
+    # does not split; to skip a slot write "3: -") and before bare URLs.
+    marks, last = [], 0
+    for m in re.finditer(r"(?:(?<=\s)|^)(\d{1,2})\s*:\s", text):
+        n = int(m.group(1))
+        if (last == 0 and n <= 8) or n == last + 1:      # numbers must run consecutively
+            marks.append(m.start())
+            last = n
+    for m in re.finditer(r"(?:(?<=\s)|^)https?://\S+\s*\|", text):
+        marks.append(m.start())
+    if marks:
+        cuts = sorted(set(marks))
+        pieces = ([text[:cuts[0]]] if cuts[0] > 0 else []) + \
+                 [text[a:b] for a, b in zip(cuts, cuts[1:] + [len(text)])]
+        text = "\n".join(p.strip() for p in pieces if p.strip())
     nxt = 1
     for line in (l.strip() for l in text.splitlines()):
         if not line:

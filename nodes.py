@@ -6,6 +6,21 @@ import tempfile
 from . import core
 
 
+def _encode_string_as_image(text):
+    """Lossless data image: 4-byte BE length + UTF-8, 3 bytes/pixel (ForgeExpress convention)."""
+    import struct
+    import numpy as np
+    import torch
+    raw = text.encode("utf-8")
+    payload = struct.pack(">I", len(raw)) + raw
+    while len(payload) % 3:
+        payload += bytes(1)
+    side = max(1, int(np.ceil(np.sqrt(len(payload) // 3))))
+    payload += bytes(1) * (side * side * 3 - len(payload))
+    arr = np.frombuffer(payload, dtype=np.uint8).reshape(side, side, 3).astype(np.float32) / 255.0
+    return torch.from_numpy(arr).unsqueeze(0)
+
+
 class BeatCompile:
     """Cut up to 8 clips (+ optional URL extras in the manifest) to the beat of a song.
 
@@ -32,8 +47,8 @@ class BeatCompile:
             req[f"video{i}"] = ("STRING", {"default": ""})
         return {"required": req}
 
-    RETURN_TYPES = ("VIDEO", "STRING")
-    RETURN_NAMES = ("video", "report")
+    RETURN_TYPES = ("VIDEO", "STRING", "IMAGE")
+    RETURN_NAMES = ("video", "report", "report_image")
     FUNCTION = "run"
     CATEGORY = "BeatCompile"
 
@@ -58,7 +73,8 @@ class BeatCompile:
             audio_file, manifest, vids, input_dir, out, height=height, aspect=aspect, fps=fps,
             max_frames=max_frames, cut_density=cut_density, seed=seed, overedit=overedit,
             use_all=bool(use_all))
-        return (InputImpl.VideoFromFile(path), json.dumps(report, indent=1))
+        text = json.dumps(report, indent=1)
+        return (InputImpl.VideoFromFile(path), text, _encode_string_as_image(text))
 
 
 NODE_CLASS_MAPPINGS = {"BeatCompile": BeatCompile}
