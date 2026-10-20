@@ -222,21 +222,109 @@ def plan_cuts(analysis, density, min_seg=0.30):
             t1 = beats[j] if j < nb else duration
         if t1 - t0 > 0.05:
             segs.append({"t0": t0, "t1": t1, "energy": float(sum(energy[i:j]) / max(1, j - i)),
-                         "drop": any(drop[i:j])})
+                         "drop": any(drop[i:j]), "i": i, "j": j})
         i = j
     return segs
 
 
-def assign_clips(segs, clips, seed):
+
+# ── over-editing: measurable rhythmic subdivision ───────────────────────────
+# Units are sixteenth notes (4 per beat). A level picks a repeating pattern of unit lengths:
+#   1: eighths [2]   2: tresillo [3,3,2]   3: eighth + two sixteenths [2,1,1]   4: sixteenth stutter [1]
+# Drops at level >= 2 use an accelerating ramp [8,4,2,1,1] instead (halving = audible build).
+LEVEL_PATTERNS = {1: [2], 2: [3, 3, 2], 3: [2, 1, 1], 4: [1]}
+RAMP = [8, 4, 2, 1, 1]
+
+
+def _unit_times(seg, beats, duration):
+    """Evenly spaced sixteenth boundaries between the beats a segment covers."""
+    out = []
+    nb = len(beats)
+    for b in range(seg["i"], seg["j"]):
+        a = beats[b]
+        z = beats[b + 1] if b + 1 < nb else duration
+        out += [a + (z - a) * u / 4.0 for u in range(4)]
+    out.append(seg["t1"])
+    return out
+
+
+def _seg_level(energy, over):
+    return max(0, min(4, int(round(over * 4 * (0.5 + energy)))))
+
+
+def apply_rhythm(segs, analysis, over, fps, force_level=None):
+    """Split segments into rhythmic pieces; pieces shorter than ~4 frames are merged."""
+    if over <= 0 and not force_level:
+        return segs
+    beats, duration = analysis["beats"], analysis["duration"]
+    min_d = max(4.0 / fps, 0.15)
+    out = []
+    for s in segs:
+        lvl = force_level or _seg_level(s["energy"], over)
+        if lvl <= 0:
+            out.append(s)
+            continue
+        pat = RAMP if (s["drop"] and lvl >= 2) else LEVEL_PATTERNS[lvl]
+        ut = _unit_times(s, beats, duration)
+        n_units = len(ut) - 1
+        cuts, pos, k = [0], 0, 0
+        while pos < n_units:
+            pos += pat[k % len(pat)]
+            k += 1
+            cuts.append(min(pos, n_units))
+        # merge pieces shorter than min_d into the previous one
+        keep = [cuts[0]]
+        for c in cuts[1:]:
+            if ut[c] - ut[keep[-1]] >= min_d or c == n_units and len(keep) == 1:
+                keep.append(c)
+            elif c == n_units:
+                keep[-1] = c if len(keep) > 1 else keep[-1]
+        if keep[-1] != n_units:
+            keep.append(n_units)
+        for a, b in zip(keep[:-1], keep[1:]):
+            if ut[b] - ut[a] > 0.05:
+                out.append({**s, "t0": ut[a], "t1": ut[b]})
+    return out
+
+
+def plan_with_coverage(analysis, density, over, fps, n_clips, use_all):
+    segs = apply_rhythm(plan_cuts(analysis, density), analysis, over, fps)
+    if not use_all:
+        return segs, over
+    # raise the over-edit level until there are enough cuts for every clip to appear
+    o = over
+    while len(segs) < n_clips and o < 1.0:
+        o = min(1.0, o + 0.1)
+        segs = apply_rhythm(plan_cuts(analysis, density), analysis, o, fps)
+    if len(segs) < n_clips:
+        segs = apply_rhythm(plan_cuts(analysis, density), analysis, 1.0, fps, force_level=4)
+        o = 1.0
+    return segs, o
+
+
+def assign_clips(segs, clips, seed, use_all=False):
     rng = random.Random(seed)
     uses = {c["id"]: 0 for c in clips}
     cursor = {c["id"]: 0.0 for c in clips}
     prev_id = prev_motion = None
-    for s in segs:
+    forced = {}
+    if use_all:   # every clip gets the segment whose energy best matches it (rarest fit first)
+        free = set(range(len(segs)))
+        order = sorted(clips, key=lambda c: -abs(c["intensity"] - 0.5))
+        for c in order:
+            if not free:
+                break
+            k = min(free, key=lambda i: abs(segs[i]["energy"] - c["intensity"]) +
+                    (0.5 if (i - 1 in forced and forced[i - 1] == c["id"]) or
+                     (i + 1 in forced and forced[i + 1] == c["id"]) else 0.0))
+            forced[k] = c["id"]
+            free.discard(k)
+    by_id = {c["id"]: c for c in clips}
+    for idx, s in enumerate(segs):
         d = s["t1"] - s["t0"]
         target = min(1.0, s["energy"] + (0.12 if s["drop"] else 0.0))
         best, best_score = None, -1e9
-        for c in clips:
+        for c in ([by_id[forced[idx]]] if idx in forced else clips):
             sc = -abs(c["intensity"] - target)
             if len(clips) > 1 and c["id"] == prev_id:
                 sc -= 1.0
@@ -306,7 +394,8 @@ def render(segs, clips_by_id, audio_path, out_path, width, height, fps, tmp_dir,
 
 # ── top level ────────────────────────────────────────────────────────────────
 def compile_montage(audio_file, manifest, video_files, input_dir, out_path, *, height=720, aspect=0,
-                    fps=24, max_frames=2880, cut_density=1.0, seed=0, log=print):
+                    fps=24, max_frames=2880, cut_density=1.0, seed=0, overedit=0.0, use_all=False,
+                    log=print):
     tmp = tempfile.mkdtemp(prefix="beatcompile_")
     by_slot, extras = parse_manifest(manifest)
     clips = []
@@ -330,13 +419,18 @@ def compile_montage(audio_file, manifest, video_files, input_dir, out_path, *, h
         raise RuntimeError(f"audio file not found: {audio_file!r}")
     max_seconds = max(5.0, max_frames / float(fps))
     an = analyze_audio(audio, max_seconds, tmp)
-    segs = assign_clips(plan_cuts(an, cut_density), clips, seed)
+    segs, over_used = plan_with_coverage(an, cut_density, float(overedit), int(fps), len(clips), bool(use_all))
+    segs = assign_clips(segs, clips, seed, bool(use_all))
+    used = {s['clip'] for s in segs}
+    if len(used) < len(clips):
+        log(f"[BeatCompile] only {len(used)}/{len(clips)} clips fit this song's length")
     ar = {0: 16 / 9, 1: 9 / 16, 2: 1.0, 3: 4 / 3}.get(int(aspect), 16 / 9)
     h = int(height) // 2 * 2
     w = int(round(h * ar)) // 2 * 2
     log(f"[BeatCompile] {len(clips)} clips, {an['bpm']:.1f} bpm, {len(segs)} segments, {w}x{h}@{fps}")
     render(segs, {c["id"]: c for c in clips}, audio, out_path, w, h, int(fps), tmp, an["duration"])
-    report = {"bpm": round(an["bpm"], 2), "duration": round(an["duration"], 2), "size": f"{w}x{h}",
+    report = {"overedit_used": round(over_used, 2), "clips_used": len(used),
+              "bpm": round(an["bpm"], 2), "duration": round(an["duration"], 2), "size": f"{w}x{h}",
               "clips": [{k: c[k] for k in ("id", "prompt", "motion", "intensity", "duration")} for c in clips],
               "segments": [{"t0": round(s["t0"], 2), "t1": round(s["t1"], 2), "energy": round(s["energy"], 2),
                             "drop": s["drop"], "clip": s["clip"], "src_start": s["src_start"]} for s in segs]}

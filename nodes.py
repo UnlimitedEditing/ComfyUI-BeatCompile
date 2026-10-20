@@ -25,6 +25,8 @@ class BeatCompile:
             "max_frames": ("INT", {"default": 2880, "min": 48, "max": 7200}),
             "cut_density": ("FLOAT", {"default": 1.0, "min": 0.25, "max": 4.0, "step": 0.05}),
             "shuffle_seed": ("INT", {"default": 0, "min": 0, "max": 2**31 - 1}),
+            "overedit": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 1.0, "step": 0.05}),
+            "use_all": ("INT", {"default": 0, "min": 0, "max": 1}),
         }
         for i in range(1, 9):
             req[f"video{i}"] = ("STRING", {"default": ""})
@@ -36,14 +38,15 @@ class BeatCompile:
     CATEGORY = "BeatCompile"
 
     async def run(self, audio_file, manifest, height, aspect, fps, max_frames, cut_density,
-                  shuffle_seed, video1, video2, video3, video4, video5, video6, video7, video8):
+                  shuffle_seed, overedit, use_all, video1, video2, video3, video4, video5, video6, video7, video8):
         # ffmpeg + librosa are blocking; keep the event loop alive (a blocked loop can make a
         # finished Graydient job report timed_out).
         return await asyncio.to_thread(
             self._run_sync, audio_file, manifest, height, aspect, fps, max_frames, cut_density,
-            shuffle_seed, [video1, video2, video3, video4, video5, video6, video7, video8])
+            shuffle_seed, overedit, use_all, [video1, video2, video3, video4, video5, video6, video7, video8])
 
-    def _run_sync(self, audio_file, manifest, height, aspect, fps, max_frames, cut_density, seed, vids):
+    def _run_sync(self, audio_file, manifest, height, aspect, fps, max_frames, cut_density, seed,
+                  overedit, use_all, vids):
         from comfy_api.latest import InputImpl
         try:
             import folder_paths
@@ -53,7 +56,8 @@ class BeatCompile:
         out = os.path.join(tempfile.mkdtemp(prefix="beatcompile_out_"), "compilation.mp4")
         path, report = core.compile_montage(
             audio_file, manifest, vids, input_dir, out, height=height, aspect=aspect, fps=fps,
-            max_frames=max_frames, cut_density=cut_density, seed=seed)
+            max_frames=max_frames, cut_density=cut_density, seed=seed, overedit=overedit,
+            use_all=bool(use_all))
         return (InputImpl.VideoFromFile(path), json.dumps(report, indent=1))
 
 
